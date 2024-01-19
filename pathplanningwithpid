@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+import rospy
+from geometry_msgs.msg import Point, PoseStamped , PoseWithCovarianceStamped, PointStamped
+from math import pow, atan2, sqrt, pi, sin, ceil, degrees,cos, radians
+import numpy as np
+import random
+from nav_msgs.msg import Odometry
+from erp42_serial.msg import ESerial, Evelocity, setState
+from std_msgs.msg import Float64
+gps_path = None
+from tf.transformations import euler_from_quaternion
+
+class PathPlanner:
+    class PIDController:
+        def __init__(self):
+            self.kp = float(rospy.get_param("~KP", "30"))
+            self.ki = float(rospy.get_param("~KI", "15"))
+            self.kd = float(rospy.get_param("~KD", "10"))
+            self.error_integral = 0.0 
+            self.prev_error = 0.0 
+            self.upper_limit_integral = 50
+            self.lower_limit_integral = -50
+            self.upper_limit = float(rospy.get_param("~upper_limit", "100"))
+            self.lower_limit = float(rospy.get_param("~lower_limit", "-150"))
+            self.some_threshold = float(rospy.get_param("~ST", "10"))
+    
+        def adjust_output(self, x, v, pid_control):
+            ratio = v / x if x != 0 else 0
+            adjusted_coefficient = (1 - ratio) * (-0.0625*(x-2)+1.7) + ratio
+            return pid_control * adjusted_coefficient 
+        
+        def reset_integral(self):
+            self.error_integral = 0.0
+    
+        def compute_control_output(self, setpoint, current_state, dt):
+            error = setpoint - current_state
+            if abs(error) > self.some_threshold:
+                self.reset_integral()
+            self.error_integral += error * dt
+            self.error_integral = max(min(self.error_integral, self.upper_limit_integral), self.lower_limit_integral)
+            p_term = self.kp * error
+            i_term = self.ki * self.error_integral 
+            d_term = self.kd * ((error - self.prev_error) / dt)
+            control_output = p_term + i_term + d_term
+            self.prev_error = error
+            control_output = max(min(self.upper_limit, control_output), self.lower_limit)
+            return control_output
+
+    def __init__(self):
+        self.start_point = Point()
+        self.gps_path = str(rospy.get_param("~gps_path", '/home/team-miracle/catkin_ws/src/erp42_serial/src/path/data1.txt'))
+        self.current_pose = PoseWithCovarianceStamped()
+        self.heading_angle = 0
+        self.yaw = 0
+        self.current_velocity = 3
+        self.goal = Point()
+        self.L = 1.04
+        self.current_pose_rear = Point()
+        self.path = [] # 경로 리스트 생성
+        self.pose_prev = None
+        self.max_speed = rospy.get_param("~max_speed", 2)
+        self.set_state = setState()
+        self.steering_pid_controller = PIDController() #스티어링제어 목적으로 추가
+        self.previous_time = rospy.get_time()
+              
+        self.goal_point_publisher = rospy.Publisher('/goal_point', PointStamped, queue_size=1)
+        self.lookahead_point_publisher = rospy.Publisher('/lookahead_point', PointStamped, queue_size=1)      
+        self.set_state_pub = rospy.Publisher('/set_state', setState , queue_size=1)
+        self.velocity_subscriber = rospy.Subscriber('/state', Float64, self.update_velocity)       
+        self.pose_subscriber = rospy.Subscriber('/robot_pose_ekf/odom_combined', PoseWithCovarianceStamped, self.pose_callback) #GPS로 부터 받은 경
+
+        
+    def pose_callback(self, data): #로봇의 현재 위치를 읽어오는 메소드
+        self.current_pose = data
+        pose_mode = 1
+        if pose_mode == 0: # claculating heading angle with gps
+            if self.pose_prev == None:
+                self.pose_prev = self.current_pose
+                
+            elif self.calc_distance(self.current_pose, self.pose_prev) > 0.3:
+                self.pose_prev = data
+            
+            dx = self.current_pose.pose.pose.position.x - self.pose_prev.pose.pose.position.x
+            dy = self.current_pose.pose.pose.position.y - self.pose_prev.pose.pose.position.y   
+             
+            if dx or dy != 0:
+                self.yaw = atan2(dy,dx)
+        
+        elif pose_mode == 1: # claculating heading angle with imu    
+            orientation_list = [data.pose.pose.orientation.x, data.pose.pose.orientation.y, data.pose.pose.orientation.z, data.pose.pose.orientation.w]
+            _, _, yaw = euler_from_quaternion(orientation_list)
+            self.yaw = -(yaw - pi/2)
+            
+            if self.yaw > pi:
+                self.yaw -= 2 * pi        
+                
+        self.current_pose_rear.x = data.pose.pose.position.x - (self.L/2) * cos(self.yaw)
+        self.current_pose_rear.y = data.pose.pose.position.y - (self.L/2) * sin(self.yaw)
+        #rospy.loginfo("yaw: {}".format(degrees(self.yaw)))
+        #rospy.loginfo(self.current_pose)
+          
+        
+    def update_velocity(self, data):
+        self.current_velocity = data.data
+
+
+
+    def calc_distance(self, pose1, pose2):
+    
+        return sqrt(pow((pose1.pose.pose.position.x - pose2.pose.pose.position.x), 2) +
+                    pow((pose1.pose.pose.position.y - pose2.pose.pose.position.y), 2))
+
+
+       
+    def set_start_point(self): #시작 위치(현재 위치) 설정
+        while self.current_pose == None:
+            if self.current_pose:
+                break
+                
+        self.start_point.x = self.current_pose.pose.pose.position.x 
+        self.start_point.y = self.current_pose.pose.pose.position.y
+
+
+    def set_goal_point(self, x, y): #목표 지점 설정과 a_star 알고리즘 실행
+        self.goal.x = x
+        self.goal.y = y
+              
+              
+              
+    def set_paths(self):
+        with open(self.gps_path, 'r') as path:
+            while True:
+                line = path.readline()
+                if line == "":
+                    print(len(self.path))
+                    break
+                s_line = line.split()
+                s_line[0] = float(s_line[0])
+                s_line[1] = float(s_line[1])
+                self.path.append(s_line)
+
+
+
+    def euclidean_distance(self, point1, point2): # 유클리디안 거리 계산
+        x1, y1 = point1[0], point1[1]
+        x2, y2 = point2[0], point2[1]
+        return sqrt(pow((x1 - x2), 2) + pow((y1 - y2), 2))
+    
+    
+    
+    def calculate_curvature(self, steer_angle):
+        # Convert steering angle from degrees to radians
+        steer_angle_rad = steer_angle * (pi / 180)
+        curvature = 2 * sin(steer_angle_rad) / self.L
+        
+        return curvature
+
+
+    def calculate_speed(self, curvature,Kf=5):
+        speed = self.max_speed * (1 - curvature * Kf)
+        # Ensure speed is positive and doesn't exceed v_max
+        speed = max(1, min(self.max_speed, speed))
+        
+        return speed
+
+
+    def move_turtle(self): #pure pursuit control을 이용한 로봇 이동
+        rate = rospy.Rate(30)
+        goalpoint_value = (self.goal.x, self.goal.y)
+        rospy.loginfo(rospy.is_shutdown())
+        
+        while not rospy.is_shutdown():
+            currentpose_value = (self.current_pose_rear.x, self.current_pose_rear.y)
+            print(len(self.path))
+            if len(self.path) > 2:
+                idx_nearest_waypoint = self.nearest_waypoint(currentpose_value, self.path)
+                
+                #self.look_ahead_distance = 0.15 + self.current_velocity * 0.5
+                self.look_ahead_distance = 1.04 + self.current_velocity * 0.5
+                self.look_ahead_distance = np.clip(self.look_ahead_distance, 0.3, 5)
+                lookahead_point = self.waypoint_at_distance_infront_car(self.look_ahead_distance,
+                                                                 self.path,
+                                                                 idx_nearest_waypoint)
+                                                                                                 
+                rospy.loginfo(lookahead_point)
+                self.set_state.set_brake = 0
+                self.set_state.set_gear = 0
+                if abs(self.euclidean_distance(goalpoint_value, currentpose_value)) < 0.1: #현지점과 목표지점의 거리가 0.1보다 작으면 경로에 도착한 것으로 판
+                    
+                    self.set_state.set_degree = 0
+                    self.set_state_pub.publish(self.set_state)
+
+                    break
+                self.set_state.set_gear = 0
+                self.set_state.set_degree = round(self.calculate_control(lookahead_point))
+                curvature = self.calculate_curvature(self.set_state.set_degree)
+                self.set_state.set_velocity = self.calculate_speed(curvature, 1.5)         
+
+                self.set_state_pub.publish(self.set_state)
+                
+            rate.sleep()
+            
+    def calculate_control(self, lookahead_point): # 각속도 결정
+        dx = lookahead_point[0] - self.current_pose_rear.x
+        dy = lookahead_point[1] - self.current_pose_rear.y
+        target_angle = atan2(dy, dx)
+        rospy.loginfo(target_angle)
+        delta_theta = target_angle - self.yaw
+        target_distance = sqrt(dx**2 + dy**2)
+
+        if delta_theta > pi:
+            delta_theta -= 2 * pi
+        elif delta_theta < -pi:
+            delta_theta += 2 * pi
+
+        current_time = rospy.get_time()
+        dt = current_time - self.previous_time
+        adjusted_steer = self.steering_pid_controller.compute_control_output(delta_theta, 0, dt)
+        self.previous_time = current_time
+        return adjusted_steer
+       
+       
+
+    @staticmethod
+    def nearest_waypoint(position, waypoints):
+
+        position_array = np.array([position]*len(waypoints))
+        distances_to_position = np.linalg.norm(abs(position_array - waypoints), axis=1)
+        return np.argmin(distances_to_position)
+
+    def waypoint_at_distance_infront_car(self, distance, waypoints, idx_waypoint_behind_car):
+
+        dist = 0
+        i = idx_waypoint_behind_car
+
+        while dist < distance:
+            i = (i + 1) % len(waypoints)
+            dist = self.euclidean_distance(waypoints[idx_waypoint_behind_car], waypoints[i])
+            #print(dist)
+        return np.array(waypoints[i])
+
+
+
+def main():
+    rospy.init_node('Path_Planning')
+    rospy.loginfo("Pure pursuit start")
+    # PathPlanner 객체 생성
+    path = PathPlanner()
+    print('File path: ', path.gps_path)
+    # 시작 지점과 목표 지점 설정
+    path.set_start_point()
+    path.set_paths()
+    path.set_goal_point(path.path[-1][0], path.path[-1][1])
+        
+      # 로봇 이동 제어 반복
+
+    path.move_turtle()
+    rospy.loginfo("도착 지점 x:{}, y:{}".format(path.current_pose.pose.pose.position.x  , path.current_pose.pose.pose.position.y))
+    rospy.loginfo("경로1 완")
+    
+if __name__ == '__main__':
+    
+    try:
+        main()
+    except rospy.ROSInterruptException:
+        pass
