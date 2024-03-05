@@ -1,0 +1,37 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 예시 데이터: 시뮬레이션 또는 실제 운영 중에 수집된 데이터
+# 현재 상태 데이터 (예: 차량의 위치)
+current_x = np.array([1, 2, 3, 4, 5])  # 현재 x 위치
+current_y = np.array([2, 3, 5, 6, 8])  # 현재 y 위치
+
+# 목표 상태 데이터
+target_x = np.array([1, 2, 3, 4, 5])  # 목표 x 위치
+target_y = np.array([3, 4, 5, 7, 9])  # 목표 y 위치
+
+# 오차 계산
+error_x = target_x - current_x
+error_y = target_y - current_y
+
+# 현재 상태와 목표 상태 시각화
+plt.figure(figsize=(10, 5))
+plt.subplot(1, 2, 1)
+plt.plot(current_x, current_y, 'bo-', label='Current Position')
+plt.plot(target_x, target_y, 'ro-', label='Target Position')
+plt.title('Current vs Target Position')
+plt.xlabel('X Position')
+plt.ylabel('Y Position')
+plt.legend()
+
+# 오차 시각화
+plt.subplot(1, 2, 2)
+plt.plot(current_x, error_x, 'go-', label='Error in X')
+plt.plot(current_y, error_y, 'mo-', label='Error in Y')
+plt.title('Position Error')
+plt.xlabel('Time Step')
+plt.ylabel('Position Error')
+plt.legend()
+
+plt.tight_layout()
+plt.show()
