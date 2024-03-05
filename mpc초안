@@ -1,0 +1,61 @@
+import casadi as ca
+import numpy as np
+
+# 시스템 상태 및 제어 입력 정의
+x = ca.MX.sym('x')  # 예: 차량의 x 위치
+y = ca.MX.sym('y')  # 예: 차량의 y 위치
+theta = ca.MX.sym('theta')  # 예: 차량의 방향
+v = ca.MX.sym('v')  # 예: 차량의 속도
+states = ca.vertcat(x, y, theta, v)  # 상태 벡터
+n_states = states.size1()
+
+delta = ca.MX.sym('delta')  # 예: 조향각
+a = ca.MX.sym('a')  # 예: 가속도
+controls = ca.vertcat(delta, a)  # 제어 입력 벡터
+n_controls = controls.size1()
+
+# 시스템 동적 모델 정의
+L = 2.9  # 차량의 축간 거리
+dt = 0.1  # 시간 간격
+rhs = ca.vertcat(v * ca.cos(theta), 
+                 v * ca.sin(theta), 
+                 v / L * ca.tan(delta), 
+                 a)  # 우측 항 (시스템 방정식)
+f = ca.Function('f', [states, controls], [rhs])  # 시스템 함수
+
+# 최적화 문제 설정
+N = 20  # 예측 지평선
+Q = np.diag([1, 1, 0.1, 0.5])  # 상태 비용 가중치
+R = np.diag([0.1, 0.1])  # 제어 입력 비용 가중치
+P = np.diag([1, 1, 0.1, 0.5])  # 최종 상태 비용 가중치
+
+# 최적화 변수 초기화
+X = ca.MX.sym('X', n_states, N + 1)  # 모든 시간 단계에서의 상태
+U = ca.MX.sym('U', n_controls, N)  # 모든 시간 단계에서의 제어 입력
+
+# 목표 함수 및 제약 조건 설정
+obj = 0  # 목표 함수
+g = []  # 제약 조건 리스트
+for k in range(N):
+    st = X[:, k]
+    con = U[:, k]
+    obj += ca.mtimes([(st - states).T, Q, (st - states)]) + ca.mtimes([con.T, R, con])  # 비용 함수
+    st_next = X[:, k + 1]
+    f_val = f(st, con)
+    st_next_e = st + (f_val * dt)  # 오일러 방법을 사용한 상태 업데이트
+    g.append(st_next - st_next_e)  # 동적 제약 조건 추가
+
+# 최적화 문제 정의 및 해결
+OPT_variables = ca.vertcat(ca.reshape(X, -1, 1), ca.reshape(U, -1, 1))  # 최적화 변수
+nlp_problem = {'f': obj, 'x': OPT_variables, 'g': ca.vertcat(*g)}  # NLP 문제
+solver = ca.nlpsol('solver', 'ipopt', nlp_problem)  # IPOPT 솔버 사용
+
+# 최적화 문제 해결을 위한 초기 조건 및 제약 조건 설정
+x0 = ...  # 현재 상태 (칼만 필터 등으로 추정)
+lbx = ...  # 변수 하한
+ubx = ...  # 변수 상한
+lbg = ...  # 제약 조건 하한
+ubg = ...  # 제약 조건 상한
+
+# 최적화 문제 해결
+sol = solver(x0=x0, lbx=lbx, ubx=ubx, lbg=lbg, ubg=ubg)
